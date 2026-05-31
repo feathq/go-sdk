@@ -42,6 +42,11 @@ func matchOperator(operator string, lhs any, values []json.RawMessage) bool {
 			return false
 		}
 		return anyValue(values, func(v string) bool {
+			// Length cap; Go's RE2 is linear-time so we don't need the
+			// nested-quantifier check the JS / Python / Ruby ports have.
+			if len(v) > 512 {
+				return false
+			}
 			re, err := regexp.Compile(v)
 			if err != nil {
 				return false

@@ -5,9 +5,7 @@ import "encoding/json"
 // matchSegment returns true iff the context matches the named segment.
 // Mirrors the JS engine: rules are OR'd, conditions within a rule are
 // AND'd, and segment_match / segment_not_match conditions recurse so
-// "segment of segments" works even though the admin UI doesn't expose it
-// yet. Unknown segment keys evaluate to false (consistent with the
-// control plane's "delete cascade prevented" invariant).
+// "segment of segments" works. Unknown segment keys evaluate to false.
 func matchSegment(segmentKey string, ctx EvalContext, df *Datafile) bool {
 	seg, ok := df.Segments[segmentKey]
 	if !ok {

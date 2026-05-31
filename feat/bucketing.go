@@ -33,7 +33,7 @@ func bucket(salt, flagKey, contextKey string) int {
 // pickByWeight walks cumulative weights and returns the variation whose
 // cumulative range contains bucketValue. Falls back to the last variation
 // if upstream weights underflow the scale (defensive, shouldn't happen
-// since the control plane enforces sum == 100000).
+// since the producer enforces sum == 100000).
 func pickByWeight(bucketValue int, variations []RolloutVariation) (string, bool) {
 	cumulative := 0
 	for _, v := range variations {

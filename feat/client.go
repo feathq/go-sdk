@@ -7,10 +7,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+const (
+	minPollInterval  = 5 * time.Second
+	maxDatafileBytes = 10 * 1024 * 1024
 )
 
 // Config configures a Client. APIKey + DataPlaneURL are required.
@@ -18,7 +24,7 @@ type Config struct {
 	APIKey       string
 	DataPlaneURL string
 	// PollInterval is the background refresh cadence. Defaults to 30s,
-	// matching Cloudflare KV's typical global-replication ceiling.
+	// floored at 5s.
 	PollInterval time.Duration
 	// HTTPClient lets callers swap in a custom transport (e.g. for
 	// fakes in tests). Defaults to http.DefaultClient.
@@ -46,14 +52,37 @@ func NewClient(cfg Config) (*Client, error) {
 	if cfg.DataPlaneURL == "" {
 		return nil, errors.New("feat: DataPlaneURL is required")
 	}
+	if err := assertHTTPS(cfg.DataPlaneURL); err != nil {
+		return nil, err
+	}
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = 30 * time.Second
+	}
+	if cfg.PollInterval < minPollInterval {
+		cfg.PollInterval = minPollInterval
 	}
 	httpc := cfg.HTTPClient
 	if httpc == nil {
 		httpc = http.DefaultClient
 	}
 	return &Client{config: cfg, httpClient: httpc, stopCh: make(chan struct{})}, nil
+}
+
+// assertHTTPS rejects non-https DataPlaneURL so a misconfigured caller
+// can't send the bearer token over plaintext. http://localhost and
+// http://127.0.0.1 are allowed for local development and tests.
+func assertHTTPS(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("feat: DataPlaneURL is not a valid URL")
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if u.Scheme == "http" && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1") {
+		return nil
+	}
+	return errors.New("feat: DataPlaneURL must use https:// (http://localhost allowed for tests)")
 }
 
 // Start begins background polling. Safe to call once. Idempotent: calling
@@ -86,7 +115,7 @@ func (c *Client) Refresh(ctx context.Context) error {
 func (c *Client) pollLoop(ctx context.Context) {
 	if err := c.fetchOnce(ctx); err != nil {
 		// Initial fetch failure: log and keep polling. The next tick may
-		// succeed (transient network, KV warm-up).
+		// succeed (transient network).
 		fmt.Fprintf(io.Discard, "feat: initial fetch failed: %v\n", err)
 	}
 	t := time.NewTicker(c.config.PollInterval)
@@ -123,11 +152,24 @@ func (c *Client) fetchOnce(ctx context.Context) error {
 	case http.StatusNotModified:
 		return nil
 	case http.StatusNotFound:
-		// Egress hasn't landed yet for this env. Treat as transient.
+		// No datafile yet; treat as transient.
+		return nil
+	case http.StatusTooManyRequests:
 		return nil
 	case http.StatusOK:
+		if resp.ContentLength > maxDatafileBytes {
+			return errors.New("feat: datafile exceeds maximum allowed size")
+		}
 		var df Datafile
-		if err := json.NewDecoder(resp.Body).Decode(&df); err != nil {
+		limited := io.LimitReader(resp.Body, maxDatafileBytes+1)
+		body, err := io.ReadAll(limited)
+		if err != nil {
+			return fmt.Errorf("feat: read datafile: %w", err)
+		}
+		if int64(len(body)) > maxDatafileBytes {
+			return errors.New("feat: datafile exceeds maximum allowed size")
+		}
+		if err := json.Unmarshal(body, &df); err != nil {
 			return fmt.Errorf("feat: decode datafile: %w", err)
 		}
 		c.datafile.Store(&df)
@@ -136,7 +178,7 @@ func (c *Client) fetchOnce(ctx context.Context) error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("feat: fetch datafile: %s", resp.Status)
+		return fmt.Errorf("feat: fetch datafile: %d", resp.StatusCode)
 	}
 }
 

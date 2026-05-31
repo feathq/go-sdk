@@ -41,7 +41,7 @@ func Evaluate(flagKey string, defaultValue json.RawMessage, ctx EvalContext, df 
 		return EvaluationResult{
 			Value:        defaultValue,
 			Reason:       ReasonError,
-			ErrorMessage: "flag '" + flagKey + "' not found in datafile",
+			ErrorMessage: "flag could not be evaluated",
 		}
 	}
 
@@ -127,6 +127,6 @@ func resolveVariation(flag FlagSpec, variationID string, reason Reason, defaultV
 	return EvaluationResult{
 		Value:        defaultValue,
 		Reason:       ReasonError,
-		ErrorMessage: "variation '" + variationID + "' missing from flag '" + flag.Key + "'",
+		ErrorMessage: "flag could not be evaluated",
 	}
 }

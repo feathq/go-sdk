@@ -9,9 +9,9 @@ package feat
 
 import "encoding/json"
 
-// Datafile is the per-environment evaluatable snapshot the data plane
-// serves to SDKs. Keyed by flag/segment/kind *key* (not id) for fast
-// lookup on the eval hot path.
+// Datafile is the per-environment evaluatable snapshot served to SDKs.
+// Keyed by flag/segment/kind *key* (not id) for fast lookup on the eval
+// hot path.
 type Datafile struct {
 	SchemaVersion int                       `json:"schemaVersion"`
 	EnvID         string                    `json:"envId"`
@@ -27,7 +27,7 @@ type Datafile struct {
 
 // FlagSpec is one flag's evaluatable config for the env this datafile
 // belongs to. Exactly one of DefaultVariationID or DefaultRollout is set
-// when IsEnabled; the producer (control plane) enforces that.
+// when IsEnabled; the producer enforces that invariant.
 type FlagSpec struct {
 	ID                              string           `json:"id"`
 	Key                             string           `json:"key"`
