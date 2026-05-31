@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// Parity suite: mirrors test/eval.test.ts in @feathq/feat-js-sdk so a flag
+// Parity suite: mirrors test/eval.test.ts in @feathq/js-sdk so a flag
 // served by either SDK returns the same variation for the same context.
 // New eval cases should land in both files (or a shared JSON fixture
 // suite — TODO once the Python + Ruby ports also land).

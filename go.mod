@@ -1,3 +1,3 @@
-module github.com/feathq/feat-go-sdk
+module github.com/feathq/go-sdk
 
 go 1.23
