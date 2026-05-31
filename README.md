@@ -28,30 +28,30 @@ import (
 )
 
 func main() {
-    client := feat.NewClient(feat.Config{
+    client, err := feat.NewClient(feat.Config{
         APIKey:       os.Getenv("FEAT_SERVER_KEY"),
         DataPlaneURL: "https://data.feat.so",
     })
-    defer client.Close()
-
-    if err := client.Start(context.Background()); err != nil {
+    if err != nil {
         panic(err)
     }
+    defer client.Close()
+
+    client.Start(context.Background())
     if err := client.Ready(context.Background()); err != nil {
         panic(err)
     }
 
-    result, _ := client.EvaluateBool(
-        "checkout-v2",
-        false,
-        feat.EvalContext{
-            TargetingKey: "user-123",
-            Kinds: map[string]map[string]any{
-                "user": {"plan": "pro", "email": "alice@example.com"},
-            },
+    evalCtx := feat.EvalContext{
+        TargetingKey: "user-123",
+        Kinds: map[string]feat.ContextKindObject{
+            "user": {Key: "user-123", Attrs: map[string]any{
+                "plan":  "pro",
+                "email": "alice@example.com",
+            }},
         },
-    )
-    fmt.Println("checkout-v2:", result.Value)
+    }
+    fmt.Println("checkout-v2:", client.GetBooleanValue("checkout-v2", false, evalCtx))
 }
 ```
 
