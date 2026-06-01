@@ -139,6 +139,7 @@ func (c *Client) fetchOnce(ctx context.Context) error {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+	req.Header.Set("User-Agent", "feat-sdk-go/"+Version)
 	if etag := c.etag.Load(); etag != nil {
 		req.Header.Set("If-None-Match", *etag)
 	}
