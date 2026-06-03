@@ -1,12 +1,12 @@
 <p align="center">
   <a href="https://feat.so">
-    <img src="https://feat.so/logo/wordmark.png" alt="feat.so" width="200" />
+    <img src="https://feat.so/logo/wordmark.png" alt="feat.so" width="320" />
   </a>
 </p>
 
 ---
 
-# go-sdk
+# feat Go SDK
 
 Server-side Go SDK for [feat](https://feat.so) feature flags. Local flag evaluation against a polled datafile. Standard library only.
 
