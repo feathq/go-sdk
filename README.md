@@ -37,8 +37,8 @@ import (
 
 func main() {
     client, err := feat.NewClient(feat.Config{
-        APIKey:       os.Getenv("FEAT_SERVER_KEY"),
-        DataPlaneURL: "https://data.feat.so",
+        APIKey: os.Getenv("FEAT_SERVER_KEY"),
+        URL:    "https://data-01.feat.so", // optional; this is the default
     })
     if err != nil {
         panic(err)

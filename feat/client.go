@@ -17,12 +17,15 @@ import (
 const (
 	minPollInterval  = 5 * time.Second
 	maxDatafileBytes = 10 * 1024 * 1024
+	defaultURL       = "https://data-01.feat.so"
 )
 
-// Config configures a Client. APIKey + DataPlaneURL are required.
+// Config configures a Client. Only APIKey is required.
 type Config struct {
-	APIKey       string
-	DataPlaneURL string
+	APIKey string
+	// URL is the feat endpoint. Optional; defaults to the production
+	// endpoint. Override for region pinning, staging, or local dev.
+	URL string
 	// PollInterval is the background refresh cadence. Defaults to 30s,
 	// floored at 5s.
 	PollInterval time.Duration
@@ -49,10 +52,10 @@ func NewClient(cfg Config) (*Client, error) {
 	if cfg.APIKey == "" {
 		return nil, errors.New("feat: APIKey is required")
 	}
-	if cfg.DataPlaneURL == "" {
-		return nil, errors.New("feat: DataPlaneURL is required")
+	if cfg.URL == "" {
+		cfg.URL = defaultURL
 	}
-	if err := assertHTTPS(cfg.DataPlaneURL); err != nil {
+	if err := assertHTTPS(cfg.URL); err != nil {
 		return nil, err
 	}
 	if cfg.PollInterval == 0 {
@@ -68,13 +71,13 @@ func NewClient(cfg Config) (*Client, error) {
 	return &Client{config: cfg, httpClient: httpc, stopCh: make(chan struct{})}, nil
 }
 
-// assertHTTPS rejects non-https DataPlaneURL so a misconfigured caller
-// can't send the bearer token over plaintext. http://localhost and
+// assertHTTPS rejects non-https URL so a misconfigured caller can't
+// send the bearer token over plaintext. http://localhost and
 // http://127.0.0.1 are allowed for local development and tests.
 func assertHTTPS(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return errors.New("feat: DataPlaneURL is not a valid URL")
+		return errors.New("feat: URL is not a valid URL")
 	}
 	if u.Scheme == "https" {
 		return nil
@@ -82,7 +85,7 @@ func assertHTTPS(raw string) error {
 	if u.Scheme == "http" && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1") {
 		return nil
 	}
-	return errors.New("feat: DataPlaneURL must use https:// (http://localhost allowed for tests)")
+	return errors.New("feat: URL must use https:// (http://localhost allowed for tests)")
 }
 
 // Start begins background polling. Safe to call once. Idempotent: calling
@@ -133,7 +136,7 @@ func (c *Client) pollLoop(ctx context.Context) {
 }
 
 func (c *Client) fetchOnce(ctx context.Context) error {
-	url := strings.TrimSuffix(c.config.DataPlaneURL, "/") + "/sdk/v1/datafile"
+	url := strings.TrimSuffix(c.config.URL, "/") + "/sdk/v1/datafile"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
