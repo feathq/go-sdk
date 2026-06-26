@@ -32,6 +32,12 @@ type Config struct {
 	// HTTPClient lets callers swap in a custom transport (e.g. for
 	// fakes in tests). Defaults to http.DefaultClient.
 	HTTPClient *http.Client
+	// DisableStreaming turns off the live datafile stream. Streaming is on
+	// by default: the client holds a Server-Sent Events connection and
+	// adopts each pushed datafile the instant it changes, while the
+	// background poll keeps running as a slow safety net. Set true to rely
+	// on polling alone.
+	DisableStreaming bool
 }
 
 // Client holds the in-memory datafile and refreshes it on a background
@@ -44,6 +50,15 @@ type Client struct {
 	etag       atomic.Pointer[string]
 	stopCh     chan struct{}
 	stopOnce   sync.Once
+	startOnce  sync.Once
+	// writeMu serializes datafile writers (the poll loop and the stream
+	// loop) so the version-ordered "adopt only if newer" check is atomic.
+	// Reads stay lock-free via the atomic pointer above.
+	writeMu sync.Mutex
+	// streamBackoffMin / streamBackoffMax bound the exponential reconnect
+	// delay for the stream loop. Set in NewClient; overridable in tests.
+	streamBackoffMin time.Duration
+	streamBackoffMax time.Duration
 }
 
 // NewClient returns a Client. Call Start to begin polling and Ready to
@@ -68,7 +83,13 @@ func NewClient(cfg Config) (*Client, error) {
 	if httpc == nil {
 		httpc = http.DefaultClient
 	}
-	return &Client{config: cfg, httpClient: httpc, stopCh: make(chan struct{})}, nil
+	return &Client{
+		config:           cfg,
+		httpClient:       httpc,
+		stopCh:           make(chan struct{}),
+		streamBackoffMin: defaultStreamBackoffMin,
+		streamBackoffMax: defaultStreamBackoffMax,
+	}, nil
 }
 
 // assertHTTPS rejects non-https URL so a misconfigured caller can't
@@ -88,10 +109,19 @@ func assertHTTPS(raw string) error {
 	return errors.New("feat: URL must use https:// (http://localhost allowed for tests)")
 }
 
-// Start begins background polling. Safe to call once. Idempotent: calling
-// twice is a no-op.
+// Start begins background refresh. Idempotent: calling twice is a no-op.
+//
+// The poll loop always runs and acts as a slow safety net. Unless streaming
+// is disabled, a second goroutine holds a live Server-Sent Events connection
+// and adopts pushed datafiles in real time; if that stream drops it
+// reconnects with backoff while the poll loop keeps the datafile fresh.
 func (c *Client) Start(ctx context.Context) {
-	go c.pollLoop(ctx)
+	c.startOnce.Do(func() {
+		go c.pollLoop(ctx)
+		if !c.config.DisableStreaming {
+			go c.streamLoop(ctx)
+		}
+	})
 }
 
 // Ready blocks until the first datafile is in memory or ctx is cancelled.
@@ -176,7 +206,7 @@ func (c *Client) fetchOnce(ctx context.Context) error {
 		if err := json.Unmarshal(body, &df); err != nil {
 			return fmt.Errorf("feat: decode datafile: %w", err)
 		}
-		c.datafile.Store(&df)
+		c.adopt(&df)
 		if e := resp.Header.Get("ETag"); e != "" {
 			c.etag.Store(&e)
 		}
@@ -184,6 +214,22 @@ func (c *Client) fetchOnce(ctx context.Context) error {
 	default:
 		return fmt.Errorf("feat: fetch datafile: %d", resp.StatusCode)
 	}
+}
+
+// adopt stores df only if it is strictly newer than the datafile currently
+// in memory (by Version), so an out-of-order poll response or a replayed
+// stream frame can never roll the client back. The first datafile (current
+// is nil) is always adopted. Returns true when df was stored. Writers are
+// serialized by writeMu; readers continue to load the atomic pointer
+// lock-free.
+func (c *Client) adopt(df *Datafile) bool {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if cur := c.datafile.Load(); cur != nil && df.Version <= cur.Version {
+		return false
+	}
+	c.datafile.Store(df)
+	return true
 }
 
 // Evaluate returns the raw evaluation result. Most callers want the typed
