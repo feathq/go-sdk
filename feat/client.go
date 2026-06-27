@@ -232,6 +232,14 @@ func (c *Client) fetchOnce(ctx context.Context) error {
 func (c *Client) adopt(df *Datafile) bool {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	return c.adoptLocked(df)
+}
+
+// adoptLocked is the version-ordered store shared by every writer. The caller
+// must already hold writeMu. The incremental patch path holds writeMu across
+// its read-merge-store sequence and reuses this core so a patch and a
+// concurrent poll/put can never interleave into a rollback.
+func (c *Client) adoptLocked(df *Datafile) bool {
 	if cur := c.datafile.Load(); cur != nil && df.Version <= cur.Version {
 		return false
 	}

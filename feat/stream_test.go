@@ -13,15 +13,22 @@ import (
 	"time"
 )
 
-// streamDatafile builds a datafile carrying a single boolean flag "checkout"
-// whose fallthrough variation is `on`. Evaluating the flag therefore reflects
-// which datafile version is currently in memory.
-func streamDatafile(version int64, on bool) *Datafile {
+// checkoutFlag builds the single boolean flag "checkout" whose fallthrough
+// variation is `on`. Evaluating it therefore reflects the datafile version in
+// memory.
+func checkoutFlag(on bool) FlagSpec {
 	flag := boolFlag()
 	if on {
 		flag.DefaultVariationID = ptr(trueVar.ID)
 	}
-	df := makeDatafile(map[string]FlagSpec{"checkout": flag}, nil)
+	return flag
+}
+
+// streamDatafile builds a datafile carrying a single boolean flag "checkout"
+// whose fallthrough variation is `on`. Evaluating the flag therefore reflects
+// which datafile version is currently in memory.
+func streamDatafile(version int64, on bool) *Datafile {
+	df := makeDatafile(map[string]FlagSpec{"checkout": checkoutFlag(on)}, nil)
 	df.Version = version
 	return df
 }
@@ -29,6 +36,25 @@ func streamDatafile(version int64, on bool) *Datafile {
 func sseFrame(version int64, on bool) string {
 	b, _ := json.Marshal(streamDatafile(version, on))
 	return "event: put\nid: " + strconv.FormatInt(version, 10) + "\ndata: " + string(b) + "\n\n"
+}
+
+// patchFrame builds an `event: patch` SSE frame carrying the given delta. The
+// id line is the target version, mirroring the put frames.
+func patchFrame(p datafilePatch) string {
+	b, _ := json.Marshal(p)
+	return "event: patch\nid: " + strconv.FormatInt(p.To, 10) + "\ndata: " + string(b) + "\n\n"
+}
+
+// flipCheckout is a patch that flips the "checkout" flag's fallthrough to `on`,
+// advancing version from->to and stamping a fresh etag.
+func flipCheckout(from, to int64, on bool) datafilePatch {
+	return datafilePatch{
+		From:        from,
+		To:          to,
+		Etag:        "etag-" + strconv.FormatInt(to, 10),
+		GeneratedAt: "2026-05-17T00:00:01Z",
+		Flags:       map[string]FlagSpec{"checkout": checkoutFlag(on)},
+	}
 }
 
 func waitFor(t *testing.T, d time.Duration, cond func() bool) {
@@ -48,6 +74,7 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool) {
 // a sentinel that drops the current stream connection (to exercise reconnect).
 type sseServer struct {
 	pushCh    chan *Datafile
+	rawCh     chan string  // arbitrary pre-built SSE frames (e.g. patch frames)
 	streamErr atomic.Int32 // when non-zero, the stream endpoint replies with this status
 	oversize  atomic.Bool  // when set, the next connection emits one oversized frame then drops
 	active    atomic.Int32 // currently open stream connections
@@ -61,11 +88,12 @@ type sseServer struct {
 }
 
 func newSSEServer() *sseServer {
-	return &sseServer{pushCh: make(chan *Datafile, 8)}
+	return &sseServer{pushCh: make(chan *Datafile, 8), rawCh: make(chan string, 8)}
 }
 
-func (s *sseServer) push(df *Datafile) { s.pushCh <- df }
-func (s *sseServer) dropConnection()   { s.pushCh <- nil }
+func (s *sseServer) push(df *Datafile)    { s.pushCh <- df }
+func (s *sseServer) pushRaw(frame string) { s.rawCh <- frame }
+func (s *sseServer) dropConnection()      { s.pushCh <- nil }
 
 func (s *sseServer) authHeader() string {
 	s.mu.Lock()
@@ -125,6 +153,9 @@ func (s *sseServer) handler() http.Handler {
 			select {
 			case <-r.Context().Done():
 				return
+			case raw := <-s.rawCh:
+				_, _ = w.Write([]byte(raw))
+				fl.Flush()
 			case df := <-s.pushCh:
 				if df == nil {
 					return // sentinel: drop the connection
@@ -603,5 +634,293 @@ func TestStreamSendsSSEHeaders(t *testing.T) {
 	}
 	if got := srv.header("Cache-Control"); got != "no-cache" {
 		t.Fatalf("Cache-Control header = %q, want no-cache", got)
+	}
+}
+
+// A patch whose From matches the in-memory version applies atomically: the
+// changed flag is reflected by a later evaluation, and version + etag advance.
+func TestApplyPatchAppliesWhenVersionMatches(t *testing.T) {
+	c := bareClient(t)
+	if !c.adopt(streamDatafile(1, false)) {
+		t.Fatal("seed datafile should be adopted")
+	}
+	if c.GetBooleanValue("checkout", true, ctxUser("u1", nil)) != false {
+		t.Fatal("seed (v1) should evaluate false")
+	}
+
+	if err := c.applyPatch(mustJSON(flipCheckout(1, 2, true))); err != nil {
+		t.Fatalf("applyPatch: %v", err)
+	}
+
+	if c.GetBooleanValue("checkout", false, ctxUser("u1", nil)) != true {
+		t.Fatal("after patch the checkout flag should evaluate true")
+	}
+	df := c.datafile.Load()
+	if df.Version != 2 {
+		t.Fatalf("version should advance to 2, got %d", df.Version)
+	}
+	if df.Etag != "etag-2" {
+		t.Fatalf("datafile etag should advance to etag-2, got %q", df.Etag)
+	}
+	if e := c.etag.Load(); e == nil || *e != "etag-2" {
+		t.Fatalf("conditional-poll etag should advance to etag-2, got %v", e)
+	}
+}
+
+// A patch listing a key in removedFlags drops that flag; a later evaluation of
+// it falls back to the caller default with an ERROR reason.
+func TestApplyPatchRemovesFlag(t *testing.T) {
+	c := bareClient(t)
+	if !c.adopt(streamDatafile(1, true)) {
+		t.Fatal("seed datafile should be adopted")
+	}
+	patch := datafilePatch{From: 1, To: 2, Etag: "etag-2", RemovedFlags: []string{"checkout"}}
+	if err := c.applyPatch(mustJSON(patch)); err != nil {
+		t.Fatalf("applyPatch: %v", err)
+	}
+	if _, ok := c.datafile.Load().Flags["checkout"]; ok {
+		t.Fatal("removed flag must be gone from the datafile")
+	}
+	r := c.Evaluate("checkout", raw("fallback"), ctxUser("u1", nil))
+	if r.Reason != ReasonError {
+		t.Fatalf("evaluating a removed flag should be ERROR, got %v", r.Reason)
+	}
+}
+
+// A patch merges added/changed segments and drops removed ones, and the new
+// segment definitions take effect in evaluation immediately.
+func TestApplyPatchMergesAndRemovesSegments(t *testing.T) {
+	c := bareClient(t)
+	// Seed: a flag gated on segment "internal-users", plus that segment.
+	flag := boolFlag()
+	flag.Rules = []RuleSpec{{
+		ID:          "r1",
+		VariationID: ptr(trueVar.ID),
+		Groups: []ConditionGroupSpec{{
+			Conditions: []ConditionSpec{{
+				Operator: "segment_match",
+				Values:   []json.RawMessage{raw("internal-users")},
+			}},
+		}},
+	}}
+	seg := SegmentSpec{Key: "internal-users", Rules: []SegmentRuleSpec{{
+		Conditions: []ConditionSpec{{
+			AttributePath: "user.email",
+			Operator:      "ends_with",
+			Values:        []json.RawMessage{raw("@feathq.com")},
+		}},
+	}}}
+	df := makeDatafile(map[string]FlagSpec{"checkout": flag}, map[string]SegmentSpec{"internal-users": seg})
+	df.Version = 1
+	if !c.adopt(df) {
+		t.Fatal("seed datafile should be adopted")
+	}
+
+	insider := ctxUser("u1", map[string]any{"email": "bob@feathq.com"})
+	if c.GetBooleanValue("checkout", false, insider) != true {
+		t.Fatal("seed: insider should match the segment and get true")
+	}
+
+	// Patch: narrow the segment to a different domain. The insider no longer
+	// matches; a contractor does.
+	narrowed := SegmentSpec{Key: "internal-users", Rules: []SegmentRuleSpec{{
+		Conditions: []ConditionSpec{{
+			AttributePath: "user.email",
+			Operator:      "ends_with",
+			Values:        []json.RawMessage{raw("@contractor.feathq.com")},
+		}},
+	}}}
+	patch := datafilePatch{
+		From:     1,
+		To:       2,
+		Etag:     "etag-2",
+		Segments: map[string]SegmentSpec{"internal-users": narrowed},
+	}
+	if err := c.applyPatch(mustJSON(patch)); err != nil {
+		t.Fatalf("applyPatch: %v", err)
+	}
+	if c.GetBooleanValue("checkout", true, insider) != false {
+		t.Fatal("after the segment patch the insider should no longer match")
+	}
+	contractor := ctxUser("u2", map[string]any{"email": "x@contractor.feathq.com"})
+	if c.GetBooleanValue("checkout", false, contractor) != true {
+		t.Fatal("after the segment patch the contractor should match")
+	}
+
+	// A removedSegments patch drops the segment entirely: nobody matches.
+	drop := datafilePatch{From: 2, To: 3, Etag: "etag-3", RemovedSegments: []string{"internal-users"}}
+	if err := c.applyPatch(mustJSON(drop)); err != nil {
+		t.Fatalf("applyPatch: %v", err)
+	}
+	if _, ok := c.datafile.Load().Segments["internal-users"]; ok {
+		t.Fatal("removed segment must be gone from the datafile")
+	}
+	if c.GetBooleanValue("checkout", true, contractor) != false {
+		t.Fatal("with the segment removed, the contractor should no longer match")
+	}
+}
+
+// A patch whose From does not match the in-memory version is ignored: the
+// datafile is left untouched (a reconnect re-seeds a full put).
+func TestApplyPatchIgnoredOnVersionMismatch(t *testing.T) {
+	c := bareClient(t)
+	if !c.adopt(streamDatafile(2, false)) {
+		t.Fatal("seed datafile should be adopted")
+	}
+	// from=1 but memory is at version 2: a gap.
+	if err := c.applyPatch(mustJSON(flipCheckout(1, 3, true))); err != nil {
+		t.Fatalf("a mismatched patch must be ignored without error, got %v", err)
+	}
+	df := c.datafile.Load()
+	if df.Version != 2 {
+		t.Fatalf("datafile must stay at version 2, got %d", df.Version)
+	}
+	if c.GetBooleanValue("checkout", true, ctxUser("u1", nil)) != false {
+		t.Fatal("value must still reflect the un-patched version 2 (false)")
+	}
+}
+
+// A patch arriving before any datafile is seeded is ignored without error.
+func TestApplyPatchIgnoredWhenNotSeeded(t *testing.T) {
+	c := bareClient(t)
+	if err := c.applyPatch(mustJSON(flipCheckout(0, 1, true))); err != nil {
+		t.Fatalf("a patch with no seeded datafile must be ignored, got %v", err)
+	}
+	if c.datafile.Load() != nil {
+		t.Fatal("no datafile should be present")
+	}
+}
+
+// A malformed patch payload returns a decode error and leaves the datafile
+// untouched.
+func TestApplyPatchMalformedJSONLeavesDatafileIntact(t *testing.T) {
+	c := bareClient(t)
+	if !c.adopt(streamDatafile(5, true)) {
+		t.Fatal("seed datafile should be adopted")
+	}
+	if err := c.applyPatch([]byte("{ this is not valid json")); err == nil {
+		t.Fatal("malformed patch should return a decode error")
+	}
+	df := c.datafile.Load()
+	if df == nil || df.Version != 5 {
+		t.Fatalf("datafile must be undisturbed at version 5, got %+v", df)
+	}
+	if c.GetBooleanValue("checkout", false, ctxUser("u1", nil)) != true {
+		t.Fatal("value must still reflect the seeded version 5 (true)")
+	}
+}
+
+// An oversized patch payload is rejected without disturbing the datafile.
+func TestApplyPatchOversizedRejected(t *testing.T) {
+	c := bareClient(t)
+	if !c.adopt(streamDatafile(3, true)) {
+		t.Fatal("seed datafile should be adopted")
+	}
+	if err := c.applyPatch([]byte(strings.Repeat("a", maxDatafileBytes+1))); err == nil {
+		t.Fatal("oversized patch should be rejected")
+	}
+	if v := c.datafile.Load().Version; v != 3 {
+		t.Fatalf("datafile must be undisturbed at version 3, got %d", v)
+	}
+}
+
+// Chained patches each land on the version the previous one produced, walking
+// the datafile forward one delta at a time.
+func TestApplyPatchChained(t *testing.T) {
+	c := bareClient(t)
+	if !c.adopt(streamDatafile(1, false)) {
+		t.Fatal("seed datafile should be adopted")
+	}
+	for _, p := range []datafilePatch{
+		flipCheckout(1, 2, true),
+		flipCheckout(2, 3, false),
+		flipCheckout(3, 4, true),
+	} {
+		if err := c.applyPatch(mustJSON(p)); err != nil {
+			t.Fatalf("applyPatch %d->%d: %v", p.From, p.To, err)
+		}
+	}
+	df := c.datafile.Load()
+	if df.Version != 4 {
+		t.Fatalf("chained patches should reach version 4, got %d", df.Version)
+	}
+	if c.GetBooleanValue("checkout", false, ctxUser("u1", nil)) != true {
+		t.Fatal("final value should reflect the last patch (true)")
+	}
+}
+
+// The SSE parser applies a patch that follows a put on the same connection.
+func TestReadEventsAppliesPatchAfterPut(t *testing.T) {
+	c := bareClient(t)
+	body := strings.NewReader(sseFrame(1, false) + patchFrame(flipCheckout(1, 2, true)))
+	if got := c.readEvents(body); !got {
+		t.Fatal("readEvents should report it received data")
+	}
+	df := c.datafile.Load()
+	if df == nil || df.Version != 2 {
+		t.Fatalf("expected version 2 after put+patch, got %+v", df)
+	}
+	if c.GetBooleanValue("checkout", false, ctxUser("u1", nil)) != true {
+		t.Fatal("value should reflect the patched version 2 (true)")
+	}
+}
+
+// Over the wire: a put seeds the datafile, then a patch frame on the same
+// connection is applied and reflected by a later evaluation.
+func TestStreamAppliesPatch(t *testing.T) {
+	srv := newSSEServer()
+	ts := httptest.NewServer(srv.handler())
+	defer ts.Close()
+
+	c := newStreamClient(t, ts.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	defer c.Close()
+
+	srv.push(streamDatafile(1, false))
+	waitFor(t, 2*time.Second, func() bool {
+		df := c.datafile.Load()
+		return df != nil && df.Version == 1
+	})
+
+	srv.pushRaw(patchFrame(flipCheckout(1, 2, true)))
+	waitFor(t, 2*time.Second, func() bool {
+		return c.GetBooleanValue("checkout", false, ctxUser("u1", nil)) == true
+	})
+	if v := c.datafile.Load().Version; v != 2 {
+		t.Fatalf("expected version 2 after patch, got %d", v)
+	}
+}
+
+// Over the wire: a patch that does not land on the current version is ignored,
+// leaving the datafile untouched.
+func TestStreamPatchIgnoredOnGap(t *testing.T) {
+	srv := newSSEServer()
+	ts := httptest.NewServer(srv.handler())
+	defer ts.Close()
+
+	c := newStreamClient(t, ts.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	defer c.Close()
+
+	srv.push(streamDatafile(1, false))
+	waitFor(t, 2*time.Second, func() bool {
+		df := c.datafile.Load()
+		return df != nil && df.Version == 1
+	})
+
+	// A patch from version 5 (a gap) must be ignored. Follow it with a valid
+	// 1->2 patch so we can wait on an observable effect and prove the gapped
+	// one did not slip through.
+	srv.pushRaw(patchFrame(flipCheckout(5, 6, true)))
+	srv.pushRaw(patchFrame(flipCheckout(1, 2, true)))
+	waitFor(t, 2*time.Second, func() bool {
+		return c.datafile.Load().Version == 2
+	})
+	if c.GetBooleanValue("checkout", false, ctxUser("u1", nil)) != true {
+		t.Fatal("the valid 1->2 patch should have applied (true)")
 	}
 }
