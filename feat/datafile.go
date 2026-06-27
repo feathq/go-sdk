@@ -106,3 +106,62 @@ type ContextKindSpec struct {
 	AvailableForRules       bool   `json:"availableForRules"`
 	AvailableForExperiments bool   `json:"availableForExperiments"`
 }
+
+// datafilePatch is an incremental delta between two datafile versions, pushed
+// as an `event: patch` SSE frame. It carries only the flags and segments that
+// changed (Flags / Segments) plus the keys that were dropped (RemovedFlags /
+// RemovedSegments). From is the version this delta applies on top of; To is the
+// version it produces. A patch is applied only when the in-memory datafile is
+// exactly at From; otherwise it is ignored and a reconnect re-seeds a full put.
+type datafilePatch struct {
+	From            int64                  `json:"from"`
+	To              int64                  `json:"to"`
+	Etag            string                 `json:"etag"`
+	GeneratedAt     string                 `json:"generatedAt"`
+	Flags           map[string]FlagSpec    `json:"flags"`
+	RemovedFlags    []string               `json:"removedFlags"`
+	Segments        map[string]SegmentSpec `json:"segments"`
+	RemovedSegments []string               `json:"removedSegments"`
+}
+
+// patchDatafile returns a new datafile with the delta applied: changed flags
+// and segments merged in, removed keys dropped, and version/etag/generatedAt
+// advanced to the patch's To. It never mutates cur (live readers hold it
+// lock-free), building fresh flag and segment maps instead. ContextKinds are
+// not touched by a patch, so the immutable map is shared with cur.
+func patchDatafile(cur *Datafile, p *datafilePatch) *Datafile {
+	next := *cur
+	next.Version = p.To
+	// Metadata is only overwritten when the patch carries it. A frame that omits
+	// etag or generatedAt must keep the current value, not wipe it to "" (an
+	// empty etag would later force a full 200 instead of a 304).
+	if p.Etag != "" {
+		next.Etag = p.Etag
+	}
+	if p.GeneratedAt != "" {
+		next.GeneratedAt = p.GeneratedAt
+	}
+
+	next.Flags = make(map[string]FlagSpec, len(cur.Flags)+len(p.Flags))
+	for k, v := range cur.Flags {
+		next.Flags[k] = v
+	}
+	for k, v := range p.Flags {
+		next.Flags[k] = v
+	}
+	for _, k := range p.RemovedFlags {
+		delete(next.Flags, k)
+	}
+
+	next.Segments = make(map[string]SegmentSpec, len(cur.Segments)+len(p.Segments))
+	for k, v := range cur.Segments {
+		next.Segments[k] = v
+	}
+	for k, v := range p.Segments {
+		next.Segments[k] = v
+	}
+	for _, k := range p.RemovedSegments {
+		delete(next.Segments, k)
+	}
+	return &next
+}

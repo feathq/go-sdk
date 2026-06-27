@@ -151,8 +151,9 @@ func (c *Client) stream(ctx context.Context) streamResult {
 
 // readEvents parses the SSE byte stream: it accumulates `event:`/`data:`/`id:`
 // fields and dispatches a frame on each blank-line boundary. Lines beginning
-// with ':' are comments (heartbeats) and are ignored. Only `put` frames carry
-// a datafile. The body is wrapped in an io.LimitReader so a single oversized
+// with ':' are comments (heartbeats) and are ignored. A `put` frame carries a
+// full datafile; a `patch` frame carries an incremental delta. The body is
+// wrapped in an io.LimitReader so a single oversized
 // frame cannot be buffered without bound: the server sends the whole datafile
 // JSON on one `data:` line, so the cap must bound the read itself, not just the
 // accumulated builder. A line truncated by the limit is dropped as an
@@ -170,11 +171,21 @@ func (c *Client) readEvents(body io.Reader) bool {
 			event = ""
 			data.Reset()
 		}()
-		if event != "put" || data.Len() == 0 {
+		if data.Len() == 0 {
 			return
 		}
-		if err := c.applyPut([]byte(data.String())); err != nil {
-			c.reportStreamError(err)
+		switch event {
+		case "put":
+			// A full datafile snapshot: adopt it if it is newer.
+			if err := c.applyPut([]byte(data.String())); err != nil {
+				c.reportStreamError(err)
+			}
+		case "patch":
+			// An incremental delta: apply it only if it lands exactly on the
+			// version in memory, otherwise ignore (reconnect re-seeds a put).
+			if err := c.applyPatch([]byte(data.String())); err != nil {
+				c.reportStreamError(err)
+			}
 		}
 	}
 	process := func(line string) {
@@ -231,6 +242,51 @@ func (c *Client) applyPut(data []byte) error {
 		return fmt.Errorf("feat: decode streamed datafile: %w", err)
 	}
 	c.adopt(&df)
+	return nil
+}
+
+// applyPatch decodes an incremental delta and applies it atomically when the
+// in-memory datafile is exactly at the patch's From version. The whole
+// read-merge-store runs under writeMu - the same lock the put and poll paths
+// take - so a patch can never interleave with another writer into a rollback
+// or a torn merge. A version mismatch or a gap (current != From, or no datafile
+// seeded yet) is ignored without error: the client stays correct because a
+// reconnect re-seeds a full put and the safety poll re-fetches. A malformed or
+// oversized payload is rejected without disturbing the current datafile.
+func (c *Client) applyPatch(data []byte) error {
+	if int64(len(data)) > maxDatafileBytes {
+		return fmt.Errorf("feat: streamed patch exceeds maximum allowed size")
+	}
+	var p datafilePatch
+	if err := json.Unmarshal(data, &p); err != nil {
+		return fmt.Errorf("feat: decode streamed patch: %w", err)
+	}
+	if p.To <= p.From {
+		// Wire invariant: a patch must advance the version. A degenerate or
+		// replayed backwards delta (to <= from) is ignored so it can never roll
+		// version, etag, or generatedAt backward.
+		return nil
+	}
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	cur := c.datafile.Load()
+	if cur == nil || cur.Version != p.From {
+		// Mismatch or gap: ignore. Reconnect (a fresh put) and the safety poll
+		// keep the client correct; applying a delta onto the wrong base would
+		// corrupt the datafile.
+		return nil
+	}
+
+	if c.adoptLocked(patchDatafile(cur, &p)) && p.Etag != "" {
+		// Advance the conditional-poll etag so the safety poll 304s instead of
+		// re-downloading a datafile the patch already brought us to. An empty
+		// patch etag is never stored: it would send an empty If-None-Match and
+		// force a full 200, so the current pointer is kept instead.
+		e := p.Etag
+		c.etag.Store(&e)
+	}
 	return nil
 }
 
