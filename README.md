@@ -8,7 +8,7 @@
 
 # feat Go SDK
 
-Server-side Go SDK for [feat](https://feat.so) feature flags. Local flag evaluation against a polled datafile. Standard library only.
+Server-side Go SDK for [feat](https://feat.so) feature flags. Local flag evaluation against a live-streamed datafile, with polling as a safety net. Standard library only.
 
 ```
 import "github.com/feathq/go-sdk/feat"
@@ -68,9 +68,12 @@ Use a **server** API key (`feat_sdk_...`).
 ## How it works
 
 - Fetches a per-environment datafile and keeps it in memory via `atomic.Pointer` for lock-free reads.
-- Polls every 30 seconds by default. ETag-aware via `If-None-Match`.
+- **Streaming is on by default.** `Start(ctx)` holds a Server-Sent Events connection to the datafile stream endpoint and adopts each new datafile the instant it changes. Updates are version-ordered: a datafile is adopted only when its `version` is strictly greater than the one in memory.
+- A background poll runs alongside the stream as a slow safety net, and takes over transparently if the stream is unreachable. The stream reconnects with exponential backoff.
+- Polls every 30 seconds by default (configurable via `PollInterval`, floored at 5s). ETag-aware via `If-None-Match`.
 - Evaluation runs in-process: no per-flag network call.
-- `Start(ctx)` spawns a goroutine that polls until `Close()` is called or `ctx` is cancelled.
+- Set `DisableStreaming: true` to rely on polling alone.
+- Both `Start(ctx)` background workers stop when `Close()` is called or `ctx` is cancelled.
 
 ## License
 
