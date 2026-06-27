@@ -49,11 +49,13 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool) {
 type sseServer struct {
 	pushCh    chan *Datafile
 	streamErr atomic.Int32 // when non-zero, the stream endpoint replies with this status
+	oversize  atomic.Bool  // when set, the next connection emits one oversized frame then drops
 	active    atomic.Int32 // currently open stream connections
 	connects  atomic.Int32 // total stream connections accepted
 
-	mu       sync.Mutex
-	lastAuth string
+	mu          sync.Mutex
+	lastAuth    string
+	lastHeaders http.Header
 
 	pollDF atomic.Pointer[Datafile]
 }
@@ -71,6 +73,15 @@ func (s *sseServer) authHeader() string {
 	return s.lastAuth
 }
 
+func (s *sseServer) header(key string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastHeaders == nil {
+		return ""
+	}
+	return s.lastHeaders.Get(key)
+}
+
 func (s *sseServer) handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -78,6 +89,7 @@ func (s *sseServer) handler() http.Handler {
 		s.connects.Add(1)
 		s.mu.Lock()
 		s.lastAuth = r.Header.Get("Authorization")
+		s.lastHeaders = r.Header.Clone()
 		s.mu.Unlock()
 
 		if code := s.streamErr.Load(); code != 0 {
@@ -98,6 +110,16 @@ func (s *sseServer) handler() http.Handler {
 
 		s.active.Add(1)
 		defer s.active.Add(-1)
+
+		// One-shot oversized frame: a single data line larger than the cap.
+		// The client must drop it (truncated) and reconnect, after which this
+		// connection serves normally.
+		if s.oversize.CompareAndSwap(true, false) {
+			_, _ = w.Write([]byte("event: put\ndata: "))
+			_, _ = w.Write(make([]byte, maxDatafileBytes+10))
+			fl.Flush()
+			return
+		}
 
 		for {
 			select {
@@ -360,5 +382,226 @@ func TestStreamingDisabledUsesPollOnly(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if n := srv.connects.Load(); n != 0 {
 		t.Fatalf("streaming disabled but stream endpoint was hit %d times", n)
+	}
+}
+
+// errSink collects errors handed to Config.OnStreamError from the stream
+// goroutine; it is safe for concurrent use.
+type errSink struct {
+	mu   sync.Mutex
+	errs []error
+}
+
+func (e *errSink) record(err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.errs = append(e.errs, err)
+}
+
+func (e *errSink) count() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.errs)
+}
+
+func bareClient(t *testing.T) *Client {
+	t.Helper()
+	c, err := NewClient(Config{APIKey: "feat_sdk_test", URL: "https://example.test"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	return c
+}
+
+// A malformed put leaves the in-memory datafile untouched and does not panic.
+func TestApplyPutMalformedJSONLeavesDatafileIntact(t *testing.T) {
+	c := bareClient(t)
+	if !c.adopt(streamDatafile(5, true)) {
+		t.Fatal("seed datafile should be adopted")
+	}
+	if err := c.applyPut([]byte("{ this is not valid json")); err == nil {
+		t.Fatal("malformed put should return a decode error")
+	}
+	df := c.datafile.Load()
+	if df == nil || df.Version != 5 {
+		t.Fatalf("datafile must be undisturbed at version 5, got %+v", df)
+	}
+	if c.GetBooleanValue("checkout", false, ctxUser("u1", nil)) != true {
+		t.Fatal("value must still reflect the seeded version 5 (true)")
+	}
+}
+
+// An oversized put is rejected by applyPut without adopting and without
+// disturbing the current datafile.
+func TestApplyPutOversizedRejected(t *testing.T) {
+	c := bareClient(t)
+	if !c.adopt(streamDatafile(3, true)) {
+		t.Fatal("seed datafile should be adopted")
+	}
+	if err := c.applyPut([]byte(strings.Repeat("a", maxDatafileBytes+1))); err == nil {
+		t.Fatal("oversized put should be rejected")
+	}
+	if v := c.datafile.Load().Version; v != 3 {
+		t.Fatalf("datafile must be undisturbed at version 3, got %d", v)
+	}
+}
+
+// A data line larger than the cap is dropped (truncated) by the parser without
+// adopting, while a valid frame received before it stays applied. The read is
+// bounded, so the oversized line is never fully buffered.
+func TestReadEventsDropsOversizedFrame(t *testing.T) {
+	c := bareClient(t)
+	big := strings.Repeat("a", maxDatafileBytes+10)
+	body := strings.NewReader(sseFrame(5, true) + "event: put\ndata: " + big + "\n\n")
+	c.readEvents(body)
+	df := c.datafile.Load()
+	if df == nil || df.Version != 5 {
+		t.Fatalf("the valid frame before the oversized one must be adopted (v5), got %+v", df)
+	}
+}
+
+// Over the wire, an oversized frame drops the connection but does not wedge the
+// client: it reconnects and adopts the next valid frame.
+func TestStreamRecoversAfterOversizedFrame(t *testing.T) {
+	srv := newSSEServer()
+	srv.oversize.Store(true)
+	ts := httptest.NewServer(srv.handler())
+	defer ts.Close()
+
+	c := newStreamClient(t, ts.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	defer c.Close()
+
+	// First connection serves the oversized frame and drops; the client
+	// reconnects, and this push lands on the healthy second connection.
+	waitFor(t, 2*time.Second, func() bool { return srv.connects.Load() >= 2 })
+	srv.push(streamDatafile(9, true))
+	waitFor(t, 2*time.Second, func() bool {
+		df := c.datafile.Load()
+		return df != nil && df.Version == 9
+	})
+}
+
+// 401 and 403 are terminal: the client surfaces the error and stops
+// reconnecting rather than hammering a rejection it cannot recover from.
+func TestStreamTerminalStatusStops(t *testing.T) {
+	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			srv := newSSEServer()
+			srv.streamErr.Store(int32(code))
+			ts := httptest.NewServer(srv.handler())
+			defer ts.Close()
+
+			sink := &errSink{}
+			c, err := NewClient(Config{
+				APIKey:        "feat_sdk_test",
+				URL:           ts.URL,
+				PollInterval:  time.Minute,
+				OnStreamError: sink.record,
+			})
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
+			c.streamBackoffMin = 5 * time.Millisecond
+			c.streamBackoffMax = 20 * time.Millisecond
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			c.Start(ctx)
+			defer c.Close()
+
+			waitFor(t, 2*time.Second, func() bool { return srv.connects.Load() >= 1 })
+			// Ample time for the loop to (wrongly) reconnect if it were going to;
+			// many backoff intervals would elapse here.
+			time.Sleep(150 * time.Millisecond)
+			if n := srv.connects.Load(); n != 1 {
+				t.Fatalf("status %d is terminal: expected exactly 1 connect, got %d", code, n)
+			}
+			if sink.count() == 0 {
+				t.Fatalf("status %d should surface a stream error to OnStreamError", code)
+			}
+		})
+	}
+}
+
+// 429 is transient: the client keeps reconnecting (the poll loop also covers
+// it, but the stream itself must keep trying).
+func TestStreamRetriesOnRateLimit(t *testing.T) {
+	srv := newSSEServer()
+	srv.streamErr.Store(http.StatusTooManyRequests)
+	ts := httptest.NewServer(srv.handler())
+	defer ts.Close()
+
+	c := newStreamClient(t, ts.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	defer c.Close()
+
+	waitFor(t, 2*time.Second, func() bool { return srv.connects.Load() >= 2 })
+}
+
+// Backoff grows on repeated failure and is capped at the max.
+func TestBackoffGrowsAndCaps(t *testing.T) {
+	min := 5 * time.Millisecond
+	max := 40 * time.Millisecond
+	want := []time.Duration{10, 20, 40, 40, 40}
+	b := min
+	for i, w := range want {
+		b = capStreamBackoff(b*2, max)
+		if b != w*time.Millisecond {
+			t.Fatalf("step %d: backoff = %s, want %dms", i, b, w)
+		}
+	}
+}
+
+// Jitter keeps the delay within [backoff/2, backoff].
+func TestJitterBounds(t *testing.T) {
+	const backoff = 20 * time.Millisecond
+	for i := 0; i < 2000; i++ {
+		j := jitterStreamBackoff(backoff)
+		if j < backoff/2 || j > backoff {
+			t.Fatalf("jitter %s out of [%s, %s]", j, backoff/2, backoff)
+		}
+	}
+	if got := jitterStreamBackoff(0); got != 0 {
+		t.Fatalf("zero backoff should not panic and should return 0, got %s", got)
+	}
+}
+
+// A connection carrying only heartbeats is live: readEvents reports it as such
+// (so the reconnect loop resets its backoff) yet adopts no datafile.
+func TestHeartbeatOnlyConnectionIsLive(t *testing.T) {
+	c := bareClient(t)
+	if !c.readEvents(strings.NewReader(": keep-alive\n\n: ping\n\n")) {
+		t.Fatal("a heartbeat-only connection must report as live to reset backoff")
+	}
+	if c.datafile.Load() != nil {
+		t.Fatal("a heartbeat carries no datafile; nothing should be adopted")
+	}
+}
+
+// The stream request carries the SSE handshake headers.
+func TestStreamSendsSSEHeaders(t *testing.T) {
+	srv := newSSEServer()
+	ts := httptest.NewServer(srv.handler())
+	defer ts.Close()
+
+	c := newStreamClient(t, ts.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	defer c.Close()
+
+	srv.push(streamDatafile(1, false))
+	waitFor(t, 2*time.Second, func() bool { return srv.connects.Load() >= 1 })
+
+	if got := srv.header("Accept"); got != "text/event-stream" {
+		t.Fatalf("Accept header = %q, want text/event-stream", got)
+	}
+	if got := srv.header("Cache-Control"); got != "no-cache" {
+		t.Fatalf("Cache-Control header = %q, want no-cache", got)
 	}
 }

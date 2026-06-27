@@ -38,6 +38,13 @@ type Config struct {
 	// background poll keeps running as a slow safety net. Set true to rely
 	// on polling alone.
 	DisableStreaming bool
+	// OnStreamError, when set, receives errors from the live stream loop:
+	// connection failures, non-recoverable HTTP statuses (such as a revoked
+	// key or a forbidden origin), retryable statuses, and decode problems.
+	// It is invoked on the stream goroutine, so keep it quick and
+	// non-blocking. The poll loop is independent and keeps the datafile fresh
+	// regardless, so a stream error is observability, not an outage.
+	OnStreamError func(error)
 }
 
 // Client holds the in-memory datafile and refreshes it on a background
