@@ -132,8 +132,15 @@ type datafilePatch struct {
 func patchDatafile(cur *Datafile, p *datafilePatch) *Datafile {
 	next := *cur
 	next.Version = p.To
-	next.Etag = p.Etag
-	next.GeneratedAt = p.GeneratedAt
+	// Metadata is only overwritten when the patch carries it. A frame that omits
+	// etag or generatedAt must keep the current value, not wipe it to "" (an
+	// empty etag would later force a full 200 instead of a 304).
+	if p.Etag != "" {
+		next.Etag = p.Etag
+	}
+	if p.GeneratedAt != "" {
+		next.GeneratedAt = p.GeneratedAt
+	}
 
 	next.Flags = make(map[string]FlagSpec, len(cur.Flags)+len(p.Flags))
 	for k, v := range cur.Flags {

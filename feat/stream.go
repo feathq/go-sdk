@@ -261,6 +261,12 @@ func (c *Client) applyPatch(data []byte) error {
 	if err := json.Unmarshal(data, &p); err != nil {
 		return fmt.Errorf("feat: decode streamed patch: %w", err)
 	}
+	if p.To <= p.From {
+		// Wire invariant: a patch must advance the version. A degenerate or
+		// replayed backwards delta (to <= from) is ignored so it can never roll
+		// version, etag, or generatedAt backward.
+		return nil
+	}
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -273,9 +279,11 @@ func (c *Client) applyPatch(data []byte) error {
 		return nil
 	}
 
-	if c.adoptLocked(patchDatafile(cur, &p)) {
+	if c.adoptLocked(patchDatafile(cur, &p)) && p.Etag != "" {
 		// Advance the conditional-poll etag so the safety poll 304s instead of
-		// re-downloading a datafile the patch already brought us to.
+		// re-downloading a datafile the patch already brought us to. An empty
+		// patch etag is never stored: it would send an empty If-None-Match and
+		// force a full 200, so the current pointer is kept instead.
 		e := p.Etag
 		c.etag.Store(&e)
 	}

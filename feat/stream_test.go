@@ -924,3 +924,230 @@ func TestStreamPatchIgnoredOnGap(t *testing.T) {
 		t.Fatal("the valid 1->2 patch should have applied (true)")
 	}
 }
+
+// A patch whose To does not advance past From (to <= from) is refused before it
+// can apply, so a degenerate or replayed backwards delta never rolls version,
+// etag, or value backward. Both the equal (to == from) and backward (to < from)
+// cases are checked.
+func TestApplyPatchRejectsNonAdvancing(t *testing.T) {
+	for _, to := range []int64{2, 1} { // equal, then backward
+		c := bareClient(t)
+		if !c.adopt(streamDatafile(2, false)) {
+			t.Fatal("seed datafile should be adopted")
+		}
+		// from=2 matches the in-memory version, so only the to<=from guard can
+		// stop this from applying.
+		if err := c.applyPatch(mustJSON(flipCheckout(2, to, true))); err != nil {
+			t.Fatalf("to=%d: non-advancing patch must be ignored without error, got %v", to, err)
+		}
+		df := c.datafile.Load()
+		if df.Version != 2 {
+			t.Fatalf("to=%d: version must stay 2, got %d", to, df.Version)
+		}
+		if df.Etag != "etag" {
+			t.Fatalf("to=%d: etag must stay %q, got %q", to, "etag", df.Etag)
+		}
+		if c.GetBooleanValue("checkout", true, ctxUser("u1", nil)) != false {
+			t.Fatalf("to=%d: value must still reflect the un-patched v2 (false)", to)
+		}
+	}
+}
+
+// Applying a patch advances generatedAt to the patch value, not just version and
+// etag.
+func TestApplyPatchAdvancesGeneratedAt(t *testing.T) {
+	c := bareClient(t)
+	if !c.adopt(streamDatafile(1, false)) {
+		t.Fatal("seed datafile should be adopted")
+	}
+	if got := c.datafile.Load().GeneratedAt; got != "2026-05-17T00:00:00Z" {
+		t.Fatalf("seed generatedAt = %q, want the makeDatafile default", got)
+	}
+	if err := c.applyPatch(mustJSON(flipCheckout(1, 2, true))); err != nil {
+		t.Fatalf("applyPatch: %v", err)
+	}
+	if got := c.datafile.Load().GeneratedAt; got != "2026-05-17T00:00:01Z" {
+		t.Fatalf("generatedAt should advance to the patch value, got %q", got)
+	}
+}
+
+// A patch that omits etag and generatedAt keeps the current metadata rather than
+// wiping it to "": the datafile fields are preserved and the conditional-poll
+// etag pointer is left intact so the safety poll still sends a real
+// If-None-Match (an empty one would force a full 200).
+func TestApplyPatchKeepsMetadataWhenOmitted(t *testing.T) {
+	c := bareClient(t)
+	if !c.adopt(streamDatafile(1, false)) {
+		t.Fatal("seed datafile should be adopted")
+	}
+	prevEtag := "etag-seed"
+	c.etag.Store(&prevEtag)
+
+	// A patch that carries flags but neither etag nor generatedAt.
+	p := datafilePatch{From: 1, To: 2, Flags: map[string]FlagSpec{"checkout": checkoutFlag(true)}}
+	if err := c.applyPatch(mustJSON(p)); err != nil {
+		t.Fatalf("applyPatch: %v", err)
+	}
+	df := c.datafile.Load()
+	if df.Version != 2 {
+		t.Fatalf("version should advance to 2, got %d", df.Version)
+	}
+	if df.Etag != "etag" {
+		t.Fatalf("datafile etag should be preserved as %q, got %q", "etag", df.Etag)
+	}
+	if df.GeneratedAt != "2026-05-17T00:00:00Z" {
+		t.Fatalf("datafile generatedAt should be preserved, got %q", df.GeneratedAt)
+	}
+	if e := c.etag.Load(); e == nil || *e != prevEtag {
+		t.Fatalf("conditional-poll etag must not be wiped by an omitted patch etag, got %v", e)
+	}
+	if c.GetBooleanValue("checkout", false, ctxUser("u1", nil)) != true {
+		t.Fatal("the patch flags should still apply even without metadata")
+	}
+}
+
+// Applying the same from->to patch twice is idempotent: the second application
+// lands on the already-advanced version (cur != from) and is ignored, leaving
+// the state unchanged.
+func TestApplyPatchIdempotent(t *testing.T) {
+	c := bareClient(t)
+	if !c.adopt(streamDatafile(1, false)) {
+		t.Fatal("seed datafile should be adopted")
+	}
+	p := flipCheckout(1, 2, true)
+	if err := c.applyPatch(mustJSON(p)); err != nil {
+		t.Fatalf("first applyPatch: %v", err)
+	}
+	if err := c.applyPatch(mustJSON(p)); err != nil {
+		t.Fatalf("replayed applyPatch must be ignored without error, got %v", err)
+	}
+	df := c.datafile.Load()
+	if df.Version != 2 {
+		t.Fatalf("version should stay 2 after the replayed patch, got %d", df.Version)
+	}
+	if c.GetBooleanValue("checkout", false, ctxUser("u1", nil)) != true {
+		t.Fatal("value should still reflect the single application (true)")
+	}
+}
+
+// A stale patch whose target the client is already past (cur >= to) is ignored:
+// memory at v3, an old 1->2 delta lands on neither the current version nor a
+// forward step.
+func TestApplyPatchIgnoredWhenAlreadyPastTarget(t *testing.T) {
+	c := bareClient(t)
+	if !c.adopt(streamDatafile(3, false)) {
+		t.Fatal("seed datafile should be adopted")
+	}
+	if err := c.applyPatch(mustJSON(flipCheckout(1, 2, true))); err != nil {
+		t.Fatalf("a superseded patch must be ignored without error, got %v", err)
+	}
+	df := c.datafile.Load()
+	if df.Version != 3 {
+		t.Fatalf("version must stay 3, got %d", df.Version)
+	}
+	if c.GetBooleanValue("checkout", true, ctxUser("u1", nil)) != false {
+		t.Fatal("value must still reflect the un-patched v3 (false)")
+	}
+}
+
+// ContextKinds are not part of a patch and must survive it unchanged.
+func TestApplyPatchPreservesContextKinds(t *testing.T) {
+	c := bareClient(t)
+	if !c.adopt(streamDatafile(1, false)) {
+		t.Fatal("seed datafile should be adopted")
+	}
+	before := c.datafile.Load().ContextKinds
+	if err := c.applyPatch(mustJSON(flipCheckout(1, 2, true))); err != nil {
+		t.Fatalf("applyPatch: %v", err)
+	}
+	after := c.datafile.Load().ContextKinds
+	if len(after) != len(before) {
+		t.Fatalf("contextKinds count changed across a patch: before %d, after %d", len(before), len(after))
+	}
+	ck, ok := after["user"]
+	if !ok || !ck.AvailableForRules || !ck.AvailableForExperiments {
+		t.Fatalf("the user context kind should survive the patch unchanged, got %+v", after)
+	}
+}
+
+// Over the wire: a complete but malformed patch frame is surfaced as an error
+// yet does not kill the stream goroutine or drop the connection; a subsequent
+// valid patch on the same connection still applies.
+func TestStreamSurvivesMalformedPatchFrame(t *testing.T) {
+	srv := newSSEServer()
+	ts := httptest.NewServer(srv.handler())
+	defer ts.Close()
+
+	c := newStreamClient(t, ts.URL)
+	sink := &errSink{}
+	c.config.OnStreamError = sink.record
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	defer c.Close()
+
+	srv.push(streamDatafile(1, false))
+	waitFor(t, 2*time.Second, func() bool {
+		df := c.datafile.Load()
+		return df != nil && df.Version == 1
+	})
+	connBefore := srv.connects.Load()
+
+	// A complete but malformed patch frame: reported and dropped, not fatal.
+	srv.pushRaw("event: patch\nid: 2\ndata: { not valid json\n\n")
+	// A valid patch on the same connection must still apply.
+	srv.pushRaw(patchFrame(flipCheckout(1, 2, true)))
+	waitFor(t, 2*time.Second, func() bool {
+		return c.datafile.Load().Version == 2
+	})
+	if c.GetBooleanValue("checkout", false, ctxUser("u1", nil)) != true {
+		t.Fatal("the valid patch after the malformed one should apply (true)")
+	}
+	if n := srv.connects.Load(); n != connBefore {
+		t.Fatalf("a malformed frame must not drop/reconnect the stream: connects %d -> %d", connBefore, n)
+	}
+	if sink.count() == 0 {
+		t.Fatal("the malformed patch frame should surface a decode error")
+	}
+}
+
+// With -race: many concurrent Evaluate readers run while a writer walks the
+// datafile forward one patch at a time, actively contending the flags-map swap.
+func TestApplyPatchRaceWithConcurrentEvaluate(t *testing.T) {
+	c := bareClient(t)
+	if !c.adopt(streamDatafile(1, false)) {
+		t.Fatal("seed datafile should be adopted")
+	}
+
+	const steps = 200
+	const readers = 16
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_ = c.GetBooleanValue("checkout", false, ctxUser("u1", nil))
+				}
+			}
+		}()
+	}
+
+	for v := int64(1); v <= steps; v++ {
+		if err := c.applyPatch(mustJSON(flipCheckout(v, v+1, v%2 == 0))); err != nil {
+			t.Fatalf("applyPatch %d->%d: %v", v, v+1, err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+
+	if got := c.datafile.Load().Version; got != steps+1 {
+		t.Fatalf("writer should have reached version %d, got %d", steps+1, got)
+	}
+}
