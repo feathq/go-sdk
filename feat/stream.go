@@ -135,6 +135,11 @@ func (c *Client) stream(ctx context.Context) streamResult {
 
 	switch resp.StatusCode {
 	case http.StatusOK:
+		// The stream is live: flip the poll to its slow safety-net cadence.
+		// When readEvents returns (the connection ended), flip it back so the
+		// poll immediately resumes as the primary refresh path.
+		c.setStreamConnected(true)
+		defer c.setStreamConnected(false)
 		return streamResult{connected: c.readEvents(resp.Body)}
 	case http.StatusUnauthorized, http.StatusForbidden:
 		// 401: the API key is invalid, revoked, or expired.

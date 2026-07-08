@@ -79,6 +79,7 @@ type sseServer struct {
 	oversize  atomic.Bool  // when set, the next connection emits one oversized frame then drops
 	active    atomic.Int32 // currently open stream connections
 	connects  atomic.Int32 // total stream connections accepted
+	pollHits  atomic.Int32 // total /sdk/v1/datafile poll requests served
 
 	mu          sync.Mutex
 	lastAuth    string
@@ -170,6 +171,7 @@ func (s *sseServer) handler() http.Handler {
 	})
 
 	mux.HandleFunc("/sdk/v1/datafile", func(w http.ResponseWriter, r *http.Request) {
+		s.pollHits.Add(1)
 		df := s.pollDF.Load()
 		if df == nil {
 			w.WriteHeader(http.StatusNotFound)
