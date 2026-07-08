@@ -18,6 +18,13 @@ const (
 	minPollInterval  = 5 * time.Second
 	maxDatafileBytes = 10 * 1024 * 1024
 	defaultURL       = "https://data-01.feat.so"
+	// defaultSafetyNetPollInterval is the slow cadence the background poll
+	// runs at while the live stream is healthy. The stream is the live path;
+	// this poll only exists to recover from a silently-wedged connection, so
+	// it deliberately runs rarely to avoid needless fetches. When the stream
+	// is down the poll reverts to PollInterval and becomes the primary refresh
+	// path. Kept internal (not a Config field) to match the js-sdk.
+	defaultSafetyNetPollInterval = 10 * time.Minute
 )
 
 // Config configures a Client. Only APIKey is required.
@@ -66,6 +73,20 @@ type Client struct {
 	// delay for the stream loop. Set in NewClient; overridable in tests.
 	streamBackoffMin time.Duration
 	streamBackoffMax time.Duration
+	// safetyNetPollInterval is the slow cadence the poll runs at while the
+	// stream is healthy. Computed in NewClient as max(defaultSafetyNet,
+	// PollInterval) so the safety net is never faster than the configured
+	// poll.
+	safetyNetPollInterval time.Duration
+	// streamConnected tracks live-stream health. It flips the poll cadence:
+	// slow while the stream is up, PollInterval while it is down or disabled.
+	streamConnected atomic.Bool
+	// pollWake nudges the poll loop to reschedule its next fetch the instant
+	// stream health changes, so a dropped stream falls back to the fast
+	// interval right away rather than waiting out the remaining safety-net
+	// delay. Buffered (size 1) and sent non-blocking: the loop always re-reads
+	// the current state on wake, so one pending nudge is enough.
+	pollWake chan struct{}
 }
 
 // NewClient returns a Client. Call Start to begin polling and Ready to
@@ -90,12 +111,19 @@ func NewClient(cfg Config) (*Client, error) {
 	if httpc == nil {
 		httpc = http.DefaultClient
 	}
+	// The safety net is never faster than the configured poll interval.
+	safetyNet := defaultSafetyNetPollInterval
+	if cfg.PollInterval > safetyNet {
+		safetyNet = cfg.PollInterval
+	}
 	return &Client{
-		config:           cfg,
-		httpClient:       httpc,
-		stopCh:           make(chan struct{}),
-		streamBackoffMin: defaultStreamBackoffMin,
-		streamBackoffMax: defaultStreamBackoffMax,
+		config:                cfg,
+		httpClient:            httpc,
+		stopCh:                make(chan struct{}),
+		streamBackoffMin:      defaultStreamBackoffMin,
+		streamBackoffMax:      defaultStreamBackoffMax,
+		safetyNetPollInterval: safetyNet,
+		pollWake:              make(chan struct{}, 1),
 	}, nil
 }
 
@@ -118,7 +146,9 @@ func assertHTTPS(raw string) error {
 
 // Start begins background refresh. Idempotent: calling twice is a no-op.
 //
-// The poll loop always runs and acts as a slow safety net. Unless streaming
+// The poll loop always runs as a safety net on a two-tier cadence: slow (10
+// minutes) while the live stream is healthy, and reverting to the fast
+// PollInterval the instant the stream drops or is disabled. Unless streaming
 // is disabled, a second goroutine holds a live Server-Sent Events connection
 // and adopts pushed datafiles in real time; if that stream drops it
 // reconnects with backoff while the poll loop keeps the datafile fresh.
@@ -158,18 +188,66 @@ func (c *Client) pollLoop(ctx context.Context) {
 		// succeed (transient network).
 		fmt.Fprintf(io.Discard, "feat: initial fetch failed: %v\n", err)
 	}
-	t := time.NewTicker(c.config.PollInterval)
-	defer t.Stop()
+	// A single-shot timer we reschedule each cycle, rather than a fixed
+	// ticker: the interval is chosen per cycle from the current stream health
+	// (slow while streaming, PollInterval otherwise). pollWake lets the stream
+	// loop reschedule us the instant health flips.
+	timer := time.NewTimer(c.pollInterval())
+	defer timer.Stop()
 	for {
 		select {
 		case <-c.stopCh:
 			return
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-c.pollWake:
+			// Stream health changed: reschedule the next poll with the new
+			// cadence, measured from now. A dropped stream therefore falls back
+			// to the fast interval promptly instead of waiting out the remaining
+			// safety-net delay.
+			resetTimer(timer, c.pollInterval())
+		case <-timer.C:
 			_ = c.fetchOnce(ctx)
+			timer.Reset(c.pollInterval())
 		}
 	}
+}
+
+// pollInterval is the cadence for the next poll: the slow safety-net interval
+// while the live stream is healthy, PollInterval when the stream is down or
+// disabled (the poll is then the primary refresh path).
+func (c *Client) pollInterval() time.Duration {
+	if !c.config.DisableStreaming && c.streamConnected.Load() {
+		return c.safetyNetPollInterval
+	}
+	return c.config.PollInterval
+}
+
+// setStreamConnected records stream health and, on a change, nudges the poll
+// loop to reschedule with the new cadence. The nudge is non-blocking: if one
+// is already pending the loop will re-read the current state when it wakes, so
+// a dropped nudge cannot leave the cadence stale.
+func (c *Client) setStreamConnected(connected bool) {
+	if c.streamConnected.Swap(connected) == connected {
+		return // no change
+	}
+	select {
+	case c.pollWake <- struct{}{}:
+	default:
+	}
+}
+
+// resetTimer stops and drains t before rescheduling it for d, so a value left
+// in the channel from a fire that raced the stop cannot trigger a spurious
+// early poll.
+func resetTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
 }
 
 func (c *Client) fetchOnce(ctx context.Context) error {

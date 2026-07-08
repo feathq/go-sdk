@@ -69,8 +69,8 @@ Use a **server** API key (`feat_sdk_...`).
 
 - Fetches a per-environment datafile and keeps it in memory via `atomic.Pointer` for lock-free reads.
 - **Streaming is on by default.** `Start(ctx)` holds a Server-Sent Events connection to the datafile stream endpoint and adopts each new datafile the instant it changes. Updates are version-ordered: a datafile is adopted only when its `version` is strictly greater than the one in memory.
-- A background poll runs alongside the stream as a slow safety net, and takes over transparently if the stream is unreachable. The stream reconnects with exponential backoff.
-- Polls every 30 seconds by default (configurable via `PollInterval`, floored at 5s). ETag-aware via `If-None-Match`.
+- A background poll runs alongside the stream as a safety net on a two-tier cadence: while the stream is healthy it polls slowly (every 10 minutes) since the stream is the live path, and the instant the stream drops or is unreachable it reverts to the fast `PollInterval` and becomes the primary refresh path. The stream reconnects with exponential backoff.
+- The fast poll runs every 30 seconds by default (configurable via `PollInterval`, floored at 5s); the slow safety-net cadence is never faster than `PollInterval`. ETag-aware via `If-None-Match`.
 - Evaluation runs in-process: no per-flag network call.
 - Set `DisableStreaming: true` to rely on polling alone.
 - Both `Start(ctx)` background workers stop when `Close()` is called or `ctx` is cancelled.
